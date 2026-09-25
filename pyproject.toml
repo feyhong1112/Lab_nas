@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Lab_nas"
+version = "0.1.0"
+description = "Access a Synology NAS from Google Colab (or any Linux box) through a NetBird mesh network."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+authors = [{ name = "Suebpong Pruttipattanapong", email = "feyhong44@gmail.com" }]
+keywords = ["synology", "netbird", "colab", "nas", "filestation", "wireguard", "socks5"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Archiving :: Backup",
+]
+dependencies = [
+    "requests>=2.20",
+    "PySocks>=1.7.1",
+    "requests-toolbelt>=0.9",
+    "alive-progress>=2.0",
+]
+
+[project.urls]
+
+Homepage = "https://github.com/feyhong1112/Lab_nas
+Repository = "https://github.com/feyhong1112/Lab_nas"
+Issues = "https://github.com/feyhong1112/Lab_nas/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/Lab_nas"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/Lab_nas", "README.md", "LICENSE"]
