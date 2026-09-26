@@ -1,48 +1,73 @@
 """
-Lab_nas - Access a Synology NAS from Google Colab through NetBird.
+Lab_nas - Access a Synology NAS through a NetBird mesh network,
+from Google Colab, Linux or Windows.
 
 Install:
 
     pip install Lab_nas
 
-Then in Colab (or any Linux box):
+Python:
 
     from Lab_nas import NetBird, Synology
 
-    NetBird().start()                      # connect Colab to NetBird
+    NetBird().start()                      # connect to NetBird
     nas = Synology('100.83.14.114')
-    nas.login()                            # uses Colab secrets SYNO_USER / SYNO_PASS
+    nas.login()                            # SYNO_USER / SYNO_PASS
     nas.ls('/')                            # list shared folders
     nas.find('*.xlsx', '/home/Drive')      # search by name
-    nas.download('/home/Drive/file.xlsx')  # download to /content
+    nas.download('/home/Drive/file.xlsx')  # download a file
     nas.download('/home/Drive/MyFolder')   # a folder arrives as MyFolder.zip
-    nas.upload('/content/file.xlsx', '/home/Drive')  # upload a local file
+    nas.upload('file.xlsx', '/home/Drive') # upload a local file
 
-Colab secrets used (🔑 sidebar, with Notebook access on):
+Terminal (bash) / cmd:
+
+    lab_nas start
+    lab_nas ls / --host 100.83.14.114
+    (or: python -m Lab_nas ...)
+
+Secrets are looked up in this order: environment variable, Colab secret
+(🔑 sidebar, Notebook access on), then you are asked to type it.
     NETBIRD_SETUP_KEY   reusable NetBird setup key
     SYNO_USER           DSM username
     SYNO_PASS           DSM password
-If a secret is missing, you are asked to type it instead.
+
+NetBird start-up order:
+    1. already connected (this library's daemon, or a NetBird app/service
+       already running on the machine)          -> nothing to do
+    2. saved identity (config.json)             -> reconnect, no setup key
+    3. NETBIRD_SETUP_KEY (argument/env/secret)  -> used without asking
+    4. still failing, or no answer in 60 s      -> you are asked for the key
+
+Where the identity (config.json) is saved:
+    Colab    /content/drive/MyDrive/netbird
+    Linux    ~/.config/Lab_nas/netbird   (or $XDG_CONFIG_HOME/Lab_nas/netbird)
+    Windows  <Documents>\\Lab_nas\\netbird
+    Override with NetBird(config_dir=...), --config-dir, or LAB_NAS_CONFIG_DIR.
 """
 
 import os
+import re
 import sys
 import json
 import time
 import shutil
+import signal
 import socket
 import fnmatch
+import tarfile
+import tempfile
 import subprocess
 import urllib.request
 from contextlib import contextmanager
 
-__version__ = '0.1.0'
-__all__ = ['NetBird', 'Synology', 'SynologyError']
+__version__ = '0.2.0'
+__all__ = ['NetBird', 'Synology', 'SynologyError', 'default_config_dir']
 
+IS_WIN = os.name == 'nt'
 SOCKS_PORT = 1080
-SOCK_FILE = '/var/run/netbird.sock'
-LOG_FILE = '/content/netbird.log'
-LOCAL_CFG = '/etc/netbird/config.json'
+DAEMON_PORT = 41799           # our own daemon; never clashes with a system NetBird
+CONNECT_TIMEOUT = 60          # seconds to wait for `netbird up`
+_UNSET = object()
 
 
 # ----------------------------------------------------------------- helpers
@@ -55,20 +80,77 @@ def _in_colab():
         return False
 
 
-def _get_secret(name, prompt=None, hidden=False):
-    """Read a Colab secret; if it doesn't exist, ask the user."""
+def _find_secret(name):
+    """Environment variable first, then Colab secret. Never prompts."""
+    if not name:
+        return None
+    val = os.environ.get(name)
+    if val:
+        return val.strip()
     if _in_colab():
         try:
             from google.colab import userdata
-            return userdata.get(name)
+            val = userdata.get(name)
+            if val:
+                return val.strip()
         except Exception:
             pass
+    return None
+
+
+def _ask(prompt, hidden=False):
+    """Ask the user; returns '' when nobody can answer (no stdin)."""
+    try:
+        if hidden:
+            from getpass import getpass
+            return getpass(prompt).strip()
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ''
+
+
+def _get_secret(name, prompt=None, hidden=False):
+    """Environment variable, Colab secret, or ask the user."""
+    val = _find_secret(name)
+    if val:
+        return val
     if prompt is None:
         raise RuntimeError(f'Secret {name} not found')
-    if hidden:
-        from getpass import getpass
-        return getpass(prompt)
-    return input(prompt)
+    return _ask(prompt, hidden)
+
+
+def _documents_dir():
+    """The user's Documents folder (follows OneDrive/redirection on Windows)."""
+    if IS_WIN:
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(260)
+            # CSIDL_PERSONAL = 5 -> "Documents"
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 \
+                    and buf.value:
+                return buf.value
+        except Exception:
+            pass
+    return os.path.join(os.path.expanduser('~'), 'Documents')
+
+
+def default_config_dir():
+    """Folder where the NetBird identity (config.json) is kept."""
+    env = os.environ.get('LAB_NAS_CONFIG_DIR')
+    if env:
+        return os.path.expanduser(env)
+    if _in_colab():
+        return '/content/drive/MyDrive/netbird'
+    if IS_WIN:
+        return os.path.join(_documents_dir(), 'Lab_nas', 'netbird')
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.join(
+        os.path.expanduser('~'), '.config')
+    return os.path.join(base, 'Lab_nas', 'netbird')
+
+
+def _default_dest():
+    return '/content' if _in_colab() else os.getcwd()
 
 
 def _port_open(port, host='127.0.0.1'):
@@ -158,31 +240,89 @@ def _progress(total, title, show=True):
 # ----------------------------------------------------------------- NetBird
 
 class NetBird:
-    """Runs NetBird in userspace (netstack) mode, suitable for Colab.
+    """Runs NetBird in userspace (netstack) mode with a local SOCKS5 proxy.
 
-    The peer identity is kept in Google Drive, so every runtime reconnects
-    as the same peer (same name, same NetBird IP).
+    Works in Colab, on Linux and on Windows. No tun device / admin driver is
+    needed. The peer identity (config.json) is saved in `config_dir`, so the
+    machine reconnects as the same peer (same name, same NetBird IP) without
+    needing the setup key again.
+
+    config_dir   where config.json is kept (default: see default_config_dir());
+                 None = don't keep it (a new peer every time)
+    hostname     peer name shown in NetBird (default 'colab' or the PC name)
+    timeout      seconds to wait for a connection before asking for the key
     """
 
-    def __init__(self, drive_dir='/content/drive/MyDrive/netbird', hostname='colab',
-                 socks_port=SOCKS_PORT, setup_key_secret='NETBIRD_SETUP_KEY'):
-        self.drive_dir = drive_dir
-        self.hostname = hostname
+    def __init__(self, config_dir=_UNSET, hostname=None, socks_port=SOCKS_PORT,
+                 setup_key_secret='NETBIRD_SETUP_KEY', timeout=CONNECT_TIMEOUT,
+                 daemon_port=DAEMON_PORT, drive_dir=_UNSET):
+        # drive_dir is the old (v0.1) name of config_dir; still accepted
+        if config_dir is _UNSET:
+            config_dir = drive_dir
+        self.config_dir = (default_config_dir() if config_dir is _UNSET
+                           else (os.path.expanduser(config_dir) if config_dir else None))
+        self.colab = _in_colab()
+        self.hostname = hostname or ('colab' if self.colab else
+                                     socket.gethostname().split('.')[0].lower())
         self.socks_port = socks_port
         self.setup_key_secret = setup_key_secret
-        self._log = None
+        self.timeout = timeout
+        self.daemon_port = daemon_port
+        self.daemon_addr = f'tcp://127.0.0.1:{daemon_port}'
+        self.exe = None
+        self.mode = None          # 'netstack' (ours) or 'system' (existing NetBird)
+        self._flags = None
+
+        # Where the running daemon keeps its files. In Colab the Drive folder
+        # is only used for saving/restoring config.json (Drive is slow + FUSE).
+        if self.colab:
+            self.run_dir = '/content/.lab_nas'
+        elif self.config_dir:
+            self.run_dir = self.config_dir
+        else:
+            self.run_dir = os.path.join(tempfile.gettempdir(), 'Lab_nas_netbird')
+
+    def __repr__(self):
+        return (f'<NetBird {self.hostname!r} config_dir={self.config_dir!r} '
+                f'socks={self.socks_port}>')
+
+    # ---- paths
 
     @property
-    def drive_cfg(self):
-        return os.path.join(self.drive_dir, 'config.json') if self.drive_dir else None
+    def run_cfg(self):
+        return os.path.join(self.run_dir, 'config.json')
 
-    def _mount_drive(self):
-        if (self.drive_dir and self.drive_dir.startswith('/content/drive')
+    @property
+    def saved_cfg(self):
+        return os.path.join(self.config_dir, 'config.json') if self.config_dir else None
+
+    @property
+    def log_file(self):
+        return os.path.join(self.run_dir, 'netbird.log')
+
+    @property
+    def pid_file(self):
+        return os.path.join(self.run_dir, 'netbird.pid')
+
+    @property
+    def drive_cfg(self):  # v0.1 name
+        return self.saved_cfg
+
+    # ---- setup
+
+    def _prepare_dirs(self):
+        if (self.colab and self.config_dir
+                and self.config_dir.startswith('/content/drive')
                 and not os.path.isdir('/content/drive/MyDrive')):
             from google.colab import drive
             drive.mount('/content/drive')
-        if self.drive_dir:
-            os.makedirs(self.drive_dir, exist_ok=True)
+        for d in filter(None, (self.config_dir, self.run_dir)):
+            os.makedirs(d, exist_ok=True)
+            if not IS_WIN:
+                try:
+                    os.chmod(d, 0o700)   # config.json holds a private key
+                except OSError:
+                    pass
 
     @staticmethod
     def _latest_tag():
@@ -199,109 +339,360 @@ class NetBird:
                     return tag
         except Exception:
             pass
-        # Fallback: the /latest page redirects to /tag/<version>
         req = urllib.request.Request(
-            'https://github.com/netbirdio/netbird/releases/latest',
-            method='HEAD')
+            'https://github.com/netbirdio/netbird/releases/latest', method='HEAD')
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.url.rstrip('/').rsplit('/', 1)[-1]
 
     @staticmethod
-    def _arch():
-        machine = os.uname().machine.lower()
-        return 'arm64' if machine in ('aarch64', 'arm64') else 'amd64'
+    def _platform():
+        machine = (os.environ.get('PROCESSOR_ARCHITECTURE', '') if IS_WIN
+                   else os.uname().machine).lower()
+        arch = 'arm64' if machine in ('aarch64', 'arm64') else 'amd64'
+        system = ('windows' if IS_WIN else
+                  'darwin' if sys.platform == 'darwin' else 'linux')
+        return system, arch
+
+    @staticmethod
+    def _bin_dir():
+        if IS_WIN:
+            base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+            return os.path.join(base, 'Lab_nas', 'bin')
+        if os.access('/usr/local/bin', os.W_OK):
+            return '/usr/local/bin'
+        return os.path.join(os.path.expanduser('~'), '.local', 'bin')
 
     def install(self):
-        if shutil.which('netbird'):
-            return
+        """Find netbird, or download it from the official GitHub releases."""
+        name = 'netbird.exe' if IS_WIN else 'netbird'
+        own = os.path.join(self._bin_dir(), name)
+        self.exe = shutil.which('netbird') or (own if os.path.isfile(own) else None)
+        if self.exe:
+            return self.exe
+
         print('Installing NetBird...')
         tag = self._latest_tag()
         ver = tag.lstrip('v')
+        system, arch = self._platform()
         url = (f'https://github.com/netbirdio/netbird/releases/download/'
-               f'{tag}/netbird_{ver}_linux_{self._arch()}.tar.gz')
-        urllib.request.urlretrieve(url, '/tmp/nb.tar.gz')
-        dest = '/usr/local/bin'
-        if not os.access(dest, os.W_OK):
-            dest = os.path.expanduser('~/.local/bin')
-            os.makedirs(dest, exist_ok=True)
-            if dest not in os.environ.get('PATH', '').split(os.pathsep):
-                os.environ['PATH'] = dest + os.pathsep + os.environ.get('PATH', '')
-        subprocess.run(['tar', '-xzf', '/tmp/nb.tar.gz', '-C', dest, 'netbird'],
-                       check=True)
-        print(f'NetBird {ver} installed to {dest}')
+               f'{tag}/netbird_{ver}_{system}_{arch}.tar.gz')
+        tgz = os.path.join(tempfile.gettempdir(), 'netbird.tar.gz')
+        urllib.request.urlretrieve(url, tgz)
+        os.makedirs(os.path.dirname(own), exist_ok=True)
+        with tarfile.open(tgz) as tar:
+            member = tar.getmember(name)
+            with tar.extractfile(member) as src, open(own, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+        if not IS_WIN:
+            os.chmod(own, 0o755)
+        os.remove(tgz)
+        self.exe = own
+        print(f'NetBird {ver} installed to {own}')
+        return own
+
+    def _cli(self, *args, timeout=15, daemon=True):
+        cmd = [self.exe or self.install(), *args]
+        if daemon:
+            cmd += ['--daemon-addr', self.daemon_addr]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    def _up_flags(self):
+        """Which optional `up` flags this netbird version knows."""
+        if self._flags is None:
+            try:
+                h = self._cli('up', '--help', daemon=False).stdout
+            except Exception:
+                h = ''
+            self._flags = {f for f in ('--no-browser', '--setup-key-file') if f in h}
+        return self._flags
+
+    # ---- state
 
     def running(self):
-        return (os.path.exists(SOCK_FILE) and
-                subprocess.run(['pgrep', '-f', 'netbird service run'],
-                               capture_output=True).returncode == 0)
+        """Is this library's NetBird daemon up?"""
+        return _port_open(self.daemon_port)
 
-    def stop(self, quiet=False):
-        subprocess.run(['pkill', '-f', 'netbird service run'], capture_output=True)
-        subprocess.run(['pkill', '-f', 'netbird up'], capture_output=True)
-        time.sleep(2)
-        if os.path.exists(SOCK_FILE):
-            os.remove(SOCK_FILE)
-        if not quiet:
-            print('NetBird stopped')
+    def info(self, system=False):
+        """Parsed `netbird status --json` (ours, or the system NetBird's)."""
+        try:
+            if system:
+                # Skip the 10 s grpc wait if no system daemon is listening
+                if IS_WIN:
+                    if not _port_open(41731):
+                        return {}
+                elif not os.path.exists('/var/run/netbird.sock'):
+                    return {}
+                r = self._cli('status', '--json', daemon=False)
+            else:
+                if not self.running():
+                    return {}
+                r = self._cli('status', '--json')
+            return json.loads(r.stdout) if r.returncode == 0 else {}
+        except Exception:
+            return {}
+
+    def connected(self, system=False):
+        return bool(self.info(system).get('management', {}).get('connected'))
+
+    def ip(self, system=False):
+        return (self.info(system).get('netbirdIp') or '').split('/')[0] or None
+
+    def status(self):
+        if not self.exe:
+            self.install()
+        sysinfo = self.info(system=True)
+        if sysinfo:
+            print('System NetBird (app/service on this machine):',
+                  'connected' if sysinfo.get('management', {}).get('connected')
+                  else sysinfo.get('daemonStatus', 'not connected'),
+                  sysinfo.get('netbirdIp', ''))
+        if self.running():
+            r = self._cli('status')
+            print(r.stdout.strip() or r.stderr.strip())
+        else:
+            print('Lab_nas NetBird daemon: not running')
+        print(f'SOCKS5 proxy on {self.socks_port}:',
+              'listening' if _port_open(self.socks_port) else 'NOT listening')
+        print(f'Identity saved in: {self.config_dir or "(not saved)"}')
 
     def log(self, lines=40):
         try:
-            with open(LOG_FILE) as f:
+            with open(self.log_file, errors='replace') as f:
                 print(''.join(f.readlines()[-lines:]))
         except FileNotFoundError:
             print('No log file yet')
 
-    def status(self):
-        subprocess.run(['netbird', 'status'])
-        print(f'SOCKS5 proxy on {self.socks_port}:',
-              'listening' if _port_open(self.socks_port) else 'NOT listening')
+    # ---- identity
 
-    def start(self, setup_key=None, timeout=60):
-        """Start the daemon and connect. Safe to run again at any time."""
-        self._mount_drive()
-        self.install()
+    @property
+    def marker_file(self):
+        """Written only after a successful connect, so a config.json that was
+        created but never registered isn't mistaken for a working identity."""
+        return os.path.join(self.config_dir, '.registered') if self.config_dir else None
 
-        # Restore saved identity so this is the same peer as last time
-        os.makedirs(os.path.dirname(LOCAL_CFG), exist_ok=True)
-        if self.drive_cfg and os.path.exists(self.drive_cfg):
-            shutil.copy(self.drive_cfg, LOCAL_CFG)
-            print('Restored saved NetBird identity')
+    def _restore_identity(self):
+        """Put the saved config.json in place. True if it is a usable identity."""
+        saved = self.saved_cfg
+        if not saved or not os.path.exists(saved):
+            return False
+        if self.colab:
+            # In Colab, config.json is copied to Drive only after a successful
+            # connect (this is also true for files saved by v0.1).
+            shutil.copy(saved, self.run_cfg)
+        elif not os.path.exists(self.marker_file):
+            return False
+        print(f'Found saved NetBird identity ({saved})')
+        return True
 
-        self.stop(quiet=True)
+    def _save_identity(self):
+        saved = self.saved_cfg
+        if not saved:
+            return
+        if os.path.exists(self.run_cfg) \
+                and os.path.abspath(saved) != os.path.abspath(self.run_cfg):
+            shutil.copy(self.run_cfg, saved)
+        if os.path.exists(saved) and not IS_WIN:
+            try:
+                os.chmod(saved, 0o600)
+            except OSError:
+                pass
+        with open(self.marker_file, 'w') as f:
+            f.write(time.strftime('%Y-%m-%d %H:%M:%S'))
 
-        env = dict(os.environ, NB_USE_NETSTACK_MODE='true',
-                   NB_SOCKS5_LISTENER_PORT=str(self.socks_port))
-        self._log = open(LOG_FILE, 'w')
-        subprocess.Popen(['netbird', 'service', 'run', '--config', LOCAL_CFG,
-                          '--log-file', 'console'],
-                         env=env, stdout=self._log, stderr=self._log,
-                         start_new_session=True)
+    # ---- daemon
+
+    def _read_pid(self):
+        try:
+            with open(self.pid_file) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_netbird(pid):
+        try:
+            if IS_WIN:
+                out = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                                     capture_output=True, text=True).stdout
+                return 'netbird' in out.lower()
+            if os.path.exists(f'/proc/{pid}/cmdline'):
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    return b'netbird' in f.read()
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    def _launch(self):
+        env = dict(os.environ,
+                   NB_USE_NETSTACK_MODE='true',
+                   NB_SOCKS5_LISTENER_PORT=str(self.socks_port),
+                   NB_STATE_DIR=os.path.join(self.run_dir, 'state'))
+        kw = {}
+        if IS_WIN:
+            kw['creationflags'] = (getattr(subprocess, 'DETACHED_PROCESS', 0x8) |
+                                   getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200))
+        else:
+            kw['start_new_session'] = True
+        log = open(self.log_file, 'w')
+        p = subprocess.Popen([self.exe, 'service', 'run', '--config', self.run_cfg,
+                              '--daemon-addr', self.daemon_addr, '--log-file', 'console'],
+                             env=env, stdout=log, stderr=log,
+                             stdin=subprocess.DEVNULL, **kw)
+        log.close()
+        with open(self.pid_file, 'w') as f:
+            f.write(str(p.pid))
 
         for _ in range(20):
-            if os.path.exists(SOCK_FILE):
+            if self.running():
+                return
+            if p.poll() is not None:
                 break
             time.sleep(1)
-        else:
-            self.log()
-            raise RuntimeError('NetBird daemon did not start (log above)')
+        self.log()
+        hint = (' On Windows, try running cmd "as Administrator".' if IS_WIN else '')
+        raise RuntimeError(f'NetBird daemon did not start (log above).{hint}')
 
-        key = setup_key or _get_secret(self.setup_key_secret, 'NetBird setup key: ',
-                                       hidden=True)
+    def stop(self, quiet=False):
+        """Stop this library's daemon (a system NetBird is never touched)."""
+        if self.running():
+            try:
+                self._cli('down', timeout=15)
+            except Exception:
+                pass
+        pid = self._read_pid()
+        if pid and self._is_netbird(pid):
+            if IS_WIN:
+                subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                               capture_output=True)
+            else:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    for _ in range(10):
+                        time.sleep(0.5)
+                        os.kill(pid, 0)
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
         try:
-            r = subprocess.run(['netbird', 'up', '--setup-key', key,
-                                '--hostname', self.hostname],
-                               capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.log()
-            raise RuntimeError('netbird up timed out (log above)') from None
-        if r.returncode != 0:
-            print(r.stdout, r.stderr)
-            raise RuntimeError('netbird up failed')
+            os.remove(self.pid_file)
+        except OSError:
+            pass
+        if not quiet:
+            print('NetBird stopped')
 
-        # Save identity back to Drive
+    # ---- connecting
+
+    def _up(self, key=None, timeout=None):
+        """Run `netbird up` once. Returns (ok, reason)."""
+        timeout = timeout or self.timeout
+        flags = self._up_flags()
+        args = ['up', '--hostname', self.hostname]
+        if '--no-browser' in flags:
+            args.append('--no-browser')     # never pop up an SSO browser page
+        key_file = None
+        if key:
+            if '--setup-key-file' in flags:  # keeps the key out of the process list
+                fd, key_file = tempfile.mkstemp(dir=self.run_dir, prefix='.key')
+                with os.fdopen(fd, 'w') as f:
+                    f.write(key)
+                args += ['--setup-key-file', key_file]
+            else:
+                args += ['--setup-key', key]
+        try:
+            r = self._cli(*args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self._cli('down', timeout=15)    # cancel the pending login
+            except Exception:
+                pass
+            return False, f'no answer within {timeout} s'
+        finally:
+            if key_file:
+                try:
+                    os.remove(key_file)
+                except OSError:
+                    pass
+        if r.returncode == 0:
+            return True, ''
+        errs = [l for l in (r.stderr + r.stdout).splitlines() if 'Error' in l]
+        reason = errs[-1] if errs else (r.stderr.strip().splitlines() or ['failed'])[-1]
+        m = re.search(r'desc = (.*)', reason)
+        return False, (m.group(1) if m else reason)[:200]
+
+    def _connect(self, setup_key, have_identity):
+        # 1) saved identity, no key needed
+        if have_identity:
+            print(f'Connecting with the saved identity (up to {self.timeout} s)...')
+            ok, why = self._up()
+            if ok:
+                return
+            print(f'  Saved identity did not connect: {why}')
+
+        # 2) a key we already have: argument / env var / Colab secret
+        key = setup_key or _find_secret(self.setup_key_secret)
+        if key:
+            src = 'argument' if setup_key else self.setup_key_secret
+            print(f'Connecting with the setup key from {src} (up to {self.timeout} s)...')
+            ok, why = self._up(key)
+            if ok:
+                return
+            print(f'  Setup key did not work: {why}')
+
+        # 3) ask the user
+        for attempt in range(3):
+            key = _ask('NetBird setup key (Enter to cancel): ', hidden=True)
+            if not key:
+                break
+            print(f'Connecting (up to {self.timeout} s)...')
+            ok, why = self._up(key)
+            if ok:
+                return
+            print(f'  Failed: {why}')
+        raise RuntimeError('Could not connect to NetBird. Check the setup key '
+                           '(NETBIRD_SETUP_KEY) and look at the log (lab_nas log, or NetBird().log())')
+
+    def start(self, setup_key=None, timeout=None, use_system=True, force=False):
+        """Connect to NetBird. Safe to run again at any time.
+
+        setup_key   only used if the saved identity can't connect
+        timeout     seconds to wait for each connection attempt (default 60)
+        use_system  if a NetBird app/service on this machine is already
+                    connected, use it instead of starting our own
+        force       restart our daemon even if it is already connected
+        """
+        if timeout:
+            self.timeout = timeout
+        self._prepare_dirs()
+        self.install()
+
+        # Already connected by the NetBird app/service (e.g. set up in a terminal)
+        if use_system and not force and self.connected(system=True):
+            self.mode = 'system'
+            print(f'NetBird is already connected on this machine '
+                  f'(IP {self.ip(system=True)}). No setup key needed; '
+                  f'the NAS is reached directly, without the SOCKS5 proxy.')
+            return self
+
+        # Our own daemon is already up and connected
+        if not force and self.running() and self.connected() \
+                and _port_open(self.socks_port):
+            self.mode = 'netstack'
+            print(f'NetBird already connected as "{self.hostname}" '
+                  f'(IP {self.ip()}), SOCKS5 proxy on {self.socks_port}')
+            return self
+
+        self.stop(quiet=True)
+        have_identity = self._restore_identity()
+        self._launch()
+        try:
+            self._connect(setup_key, have_identity)
+        except BaseException:
+            self.stop(quiet=True)       # don't leave a half-started daemon behind
+            raise
+
         time.sleep(2)
-        if self.drive_cfg and os.path.exists(LOCAL_CFG):
-            shutil.copy(LOCAL_CFG, self.drive_cfg)
+        self._save_identity()
 
         for _ in range(15):
             if _port_open(self.socks_port):
@@ -311,7 +702,11 @@ class NetBird:
             self.log()
             raise RuntimeError(f'SOCKS5 proxy not listening on {self.socks_port}')
 
-        print(f'NetBird connected as "{self.hostname}", SOCKS5 proxy on {self.socks_port}')
+        self.mode = 'netstack'
+        print(f'NetBird connected as "{self.hostname}" (IP {self.ip()}), '
+              f'SOCKS5 proxy on {self.socks_port}')
+        if self.saved_cfg:
+            print(f'Identity saved to {self.saved_cfg}')
         return self
 
 
@@ -342,7 +737,7 @@ class Synology:
     }
     OFFICE_EXT = ('.osheet', '.odoc', '.oslides')
 
-    def __init__(self, host, bases=None, socks_port=SOCKS_PORT, use_proxy=True,
+    def __init__(self, host, bases=None, socks_port=SOCKS_PORT, use_proxy='auto',
                  user_secret='SYNO_USER', pass_secret='SYNO_PASS'):
         _ensure_pysocks()
         import requests
@@ -361,13 +756,19 @@ class Synology:
 
         self.s = requests.Session()
         self.s.verify = False  # Synology usually uses a self-signed certificate
+        # 'auto': use the SOCKS5 proxy if our NetBird is running, otherwise go
+        # direct (a NetBird app/service on this machine routes 100.x itself)
+        if use_proxy == 'auto':
+            use_proxy = _port_open(socks_port)
+        self.use_proxy = bool(use_proxy)
         if use_proxy:
             proxy = f'socks5h://127.0.0.1:{socks_port}'
             self.s.proxies.update({'http': proxy, 'https': proxy})
 
     def __repr__(self):
         state = 'logged in' if self.sid else 'not logged in'
-        return f'<Synology {self.base or self.host} ({state})>'
+        via = 'SOCKS5' if self.use_proxy else 'direct'
+        return f'<Synology {self.base or self.host} ({state}, {via})>'
 
     # ---- connection
 
@@ -422,7 +823,7 @@ class Synology:
             print(f'Logged in to {self.base} as {account}')
         return self
 
-    def logout(self):
+    def logout(self, quiet=False):
         if self.sid:
             try:
                 self.s.get(f'{self.base}/webapi/entry.cgi', timeout=10,
@@ -431,7 +832,8 @@ class Synology:
             except Exception:
                 pass
         self.sid, self._creds = None, None
-        print('Logged out')
+        if not quiet:
+            print('Logged out')
 
     def _api(self, params, retry=True):
         if not self.sid:
@@ -521,7 +923,7 @@ class Synology:
             pass
         return None
 
-    def download(self, path, dest='/content', overwrite=False, extract=False, _retry=True):
+    def download(self, path, dest=None, overwrite=False, extract=False, _retry=True):
         """Download a file, or a folder (fetched as a single .zip from the NAS).
 
         A folder is always returned zipped by DSM; this saves it with a .zip
@@ -530,8 +932,12 @@ class Synology:
         extract=True  unzip a folder archive into a folder of the same name
                       next to the .zip, and return that folder's path instead.
 
+        dest           local folder (default: /content in Colab, else the
+                       current folder)
+
         Returns the local path (the .zip, or the extracted folder if extract).
         """
+        dest = dest or _default_dest()
         if path.lower().endswith(self.OFFICE_EXT):
             print('Note: this is a Synology Office file; it can only be opened in '
                   'Synology Office. Export it to .xlsx/.docx on the NAS first if needed.')
@@ -587,7 +993,7 @@ class Synology:
         print(f'{name}: {_human(done)} done in {time.time() - start:.1f}s -> {out}')
         return _maybe_extract(out)
 
-    def download_more(self, paths, dest='/content', overwrite=False, extract=False):
+    def download_more(self, paths, dest=None, overwrite=False, extract=False):
         results = []
         for p in paths:
             try:
