@@ -60,7 +60,7 @@ import subprocess
 import urllib.request
 from contextlib import contextmanager
 
-__version__ = '0.2.0'
+__version__ = '0.2.1'
 __all__ = ['NetBird', 'Synology', 'SynologyError', 'default_config_dir']
 
 IS_WIN = os.name == 'nt'
@@ -80,6 +80,22 @@ def _in_colab():
         return False
 
 
+def _colab_kernel():
+    """True only inside the Colab notebook kernel itself.
+
+    Commands run with `!` (e.g. `!lab_nas start`) are on a Colab machine but
+    outside the kernel, where drive.mount() and userdata.get() cannot work.
+    """
+    if not _in_colab():
+        return False
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and getattr(ip, 'kernel', None) is not None
+    except Exception:
+        return False
+
+
 def _find_secret(name):
     """Environment variable first, then Colab secret. Never prompts."""
     if not name:
@@ -87,7 +103,7 @@ def _find_secret(name):
     val = os.environ.get(name)
     if val:
         return val.strip()
-    if _in_colab():
+    if _colab_kernel():
         try:
             from google.colab import userdata
             val = userdata.get(name)
@@ -314,6 +330,13 @@ class NetBird:
         if (self.colab and self.config_dir
                 and self.config_dir.startswith('/content/drive')
                 and not os.path.isdir('/content/drive/MyDrive')):
+            if not _colab_kernel():
+                raise RuntimeError(
+                    'Google Drive is not mounted, and it can only be mounted from a '
+                    'notebook cell. Run this in a cell first:\n'
+                    '    from google.colab import drive; drive.mount("/content/drive")\n'
+                    'or keep the identity elsewhere: --config-dir /content/netbird '
+                    '(lost when the runtime resets)')
             from google.colab import drive
             drive.mount('/content/drive')
         for d in filter(None, (self.config_dir, self.run_dir)):
