@@ -3,13 +3,6 @@
 Access a **Synology NAS** from **Google Colab, Linux or Windows** through a
 **NetBird** mesh network, from Python or straight from bash / cmd.
 
-***REMOVED***
-
-***REMOVED***
-***REMOVED***
-***REMOVED***
-***REMOVED***
-***REMOVED***
  [release version]
 
 ## Install
