@@ -1,7 +1,7 @@
 """Command line for Lab_nas. Works the same in bash and Windows cmd.
 
     lab_nas start                          connect to NetBird
-    lab_nas login --host [host address]    log in once, stay logged in for 60 min
+    lab_nas login --host [host address]    log in once, stay logged in (no time limit)
     lab_nas session | logout               show time left | log out now
     python -m Lab_nas path --fix           put the lab_nas command on PATH
     lab_nas info                           status at a glance (also: just `lab_nas`)
@@ -20,8 +20,8 @@ Environment variables (bash: export NAME=value | cmd: set NAME=value):
     LAB_NAS_CONFIG_DIR  where the NetBird identity is kept
 
 `lab_nas login` keeps only the DSM session ticket (never the password) in a
-private file. NAS commands reuse it until it expires, then it is logged out
-on the NAS and deleted. Giving --host/--user/--password on a command skips
+private file. NAS commands reuse it until you log out (or until the time
+given with --minutes runs out), then it is logged out on the NAS and deleted. Giving --host/--user/--password on a command skips
 the saved login for that command.
 """
 
@@ -51,7 +51,7 @@ def _netbird(a):
 
 # ---------------------------------------------------------- saved login
 
-LOGIN_MINUTES = 60
+LOGIN_MINUTES = 0             # 0 = no time limit
 
 
 def _session_file():
@@ -124,7 +124,8 @@ def _saved_session():
     d = _read_session()
     if not d:
         return None
-    if time.time() >= d.get('expires', 0):
+    expires = d.get('expires', 0)
+    if expires is not None and time.time() >= expires:   # None = no time limit
         _end_session(d, f'Saved login for {d.get("user")}@{d.get("host")} expired '
                         '- run "lab_nas login" again')
         return None
@@ -132,6 +133,8 @@ def _saved_session():
 
 
 def _left(d):
+    if d.get('expires') is None:
+        return 'no time limit'
     m, sec = divmod(max(0, int(d['expires'] - time.time())), 60)
     return f'{m} min {sec} s'
 
@@ -184,18 +187,20 @@ def cmd_login(a):
             or _last_host())
     if not host:
         raise SynologyError(None, 'Give the NAS address with --host (or set LAB_NAS_HOST)')
-    if a.minutes <= 0:
-        raise SynologyError(None, '--minutes must be more than 0')
+    if a.minutes < 0:
+        raise SynologyError(None, '--minutes must be 0 (no time limit) or more')
     use_proxy = False if a.no_proxy else 'auto'
-    nas = Synology(host, socks_port=a.socks_port, use_proxy=use_proxy)
+    nas = Synology(host, socks_port=a.socks_port, use_proxy=use_proxy, keepalive=0)
     nas.login(a.user, a.password, quiet=True)
     d = {'host': host, 'base': nas.base, 'login_method': nas.login_method,
          'sid': nas.sid, 'user': nas._creds[0], 'use_proxy': nas.use_proxy,
-         'socks_port': a.socks_port, 'expires': time.time() + a.minutes * 60}
+         'socks_port': a.socks_port,
+         'expires': time.time() + a.minutes * 60 if a.minutes else None}
     _write_session(d)
     with open(_last_host_file(), 'w') as f:   # not secret; so next time --host is optional
         f.write(host)
-    say('login', f'Logged in to {hl(nas.base)} as {hl(d["user"])} for {a.minutes:g} min '
+    length = f'for {a.minutes:g} min' if a.minutes else 'with no time limit'
+    say('login', f'Logged in to {hl(nas.base)} as {hl(d["user"])} {length} '
                  '(password not saved)')
 
 
@@ -213,7 +218,8 @@ def cmd_session(a):
     if not d:
         say('warn', 'Not logged in (run "lab_nas login -H <NAS IP>")')
         return 1
-    say('login', f'Logged in as {hl(d["user"])} to {hl(d["base"])}, expires in {hl(_left(d))}')
+    when = 'no time limit' if d.get('expires') is None else f'expires in {_left(d)}'
+    say('login', f'Logged in as {hl(d["user"])} to {hl(d["base"])}, {hl(when)}')
 
 
 @_with_nas
@@ -520,12 +526,13 @@ If lab_nas is not found, use python -m Lab_nas (Windows: py -m Lab_nas).""")
                    help='add the launcher folder to PATH (no value needed)')
     s.set_defaults(func=cmd_path)
 
-    s = command('login', 'log in once and stay logged in for a while', [
-        'lab_nas login -H  [host address]  -u  [user]   -m 60',
-        'lab_nas login',
+    s = command('login', 'log in once and stay logged in', [
+        'lab_nas login -H  [host address]  -u  [user]',
+        'lab_nas login -m 60',
     ], parents=[nas])
     s.add_argument('-m', '--minutes', type=float, default=LOGIN_MINUTES, metavar='MINUTES',
-                   help=f'positive session duration, e.g. 30 or 60 (default: {LOGIN_MINUTES})')
+                   help='log out after this many minutes, e.g. 60 '
+                        '(default: 0 = no time limit)')
     s.set_defaults(func=cmd_login)
     command('logout', 'end the saved login now', ['lab_nas logout']).set_defaults(func=cmd_logout)
     command('session', 'show the saved login and time left', ['lab_nas session']).set_defaults(

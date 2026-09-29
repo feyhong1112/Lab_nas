@@ -56,11 +56,12 @@ import socket
 import fnmatch
 import tarfile
 import tempfile
+import threading
 import subprocess
 import urllib.request
 from contextlib import contextmanager
 
-__version__ = '0.2.8'
+__version__ = '0.2.9'
 __auther__ = "Fey's lite Pro Max Duo Ultra Edition"
 __all__ = ['NetBird', 'Synology', 'SynologyError', 'default_config_dir']
 
@@ -68,6 +69,8 @@ IS_WIN = os.name == 'nt'
 SOCKS_PORT = 1080
 DAEMON_PORT = 41799           # our own daemon; never clashes with a system NetBird
 CONNECT_TIMEOUT = 60          # seconds to wait for `netbird up`
+KEEPALIVE = 300               # seconds between NAS pings that keep a login alive
+SESSION_ERRORS = (106, 107, 119)  # DSM: timed out / interrupted / invalid -> re-login
 _UNSET = object()
 
 
@@ -757,7 +760,13 @@ def _row(item, size):
 
 
 class Synology:
-    """Synology File Station client that talks to the NAS through NetBird."""
+    """Synology File Station client that talks to the NAS through NetBird.
+
+    After login() the session never times out: a background keep-alive pings
+    the NAS every `keepalive` seconds, and any request that finds the session
+    ended logs in again with the credentials kept in memory.
+    keepalive=0 turns the pinging off.
+    """
 
     ERRORS = {
         100: 'Unknown error', 101: 'Invalid parameter', 102: 'API does not exist',
@@ -776,7 +785,7 @@ class Synology:
     OFFICE_EXT = ('.osheet', '.odoc', '.oslides')
 
     def __init__(self, host, bases=None, socks_port=SOCKS_PORT, use_proxy='auto',
-                 user_secret='SYNO_USER', pass_secret='SYNO_PASS'):
+                 user_secret='SYNO_USER', pass_secret='SYNO_PASS', keepalive=KEEPALIVE):
         _ensure_pysocks()
         import requests
         import urllib3
@@ -791,6 +800,11 @@ class Synology:
         self.user_secret = user_secret
         self.pass_secret = pass_secret
         self._creds = None
+
+        self.keepalive = keepalive
+        self._lock = threading.RLock()
+        self._ka_stop = None
+        self._ka_thread = None
 
         self.s = requests.Session()
         self.s.verify = False  # Synology usually uses a self-signed certificate
@@ -856,13 +870,52 @@ class Synology:
                                   otp=input('2-factor code: ').strip(), quiet=quiet)
             raise SynologyError(code, self.ERRORS.get(code, 'Login failed'))
 
-        self.sid = r['data']['sid']
-        self._creds = (account, password)  # kept in memory only, for auto re-login
+        with self._lock:
+            self.sid = r['data']['sid']
+            self._creds = (account, password)  # kept in memory only, for auto re-login
         if not quiet:
             say('login', f'Logged in to {hl(self.base)} as {hl(account)}')
+        self._start_keepalive()
         return self
 
+    def _relogin(self, old_sid):
+        """Log in again after the NAS ended the session.
+
+        Serialised so the keep-alive thread and a transfer can't both log in
+        at once (DSM would then end one of them with error 107).
+        """
+        with self._lock:
+            if self.sid != old_sid:
+                return  # another thread already did it
+            if not self._creds:
+                raise SynologyError(106, self.ERRORS[106])
+            self.login(*self._creds, quiet=True)
+
+    # ---- keep-alive
+
+    def _start_keepalive(self):
+        if not self.keepalive or (self._ka_thread and self._ka_thread.is_alive()):
+            return
+        self._ka_stop = threading.Event()
+        self._ka_thread = threading.Thread(target=self._keepalive_loop,
+                                           args=(self._ka_stop,),
+                                           name='lab_nas-keepalive', daemon=True)
+        self._ka_thread.start()
+
+    def _stop_keepalive(self):
+        if self._ka_stop:
+            self._ka_stop.set()
+        self._ka_thread = self._ka_stop = None
+
+    def _keepalive_loop(self, stop):
+        while not stop.wait(self.keepalive):
+            try:
+                self._api({'api': 'SYNO.FileStation.Info', 'version': 2, 'method': 'get'})
+            except Exception:
+                pass  # NAS / NetBird briefly unreachable: try again next round
+
     def logout(self, quiet=False):
+        self._stop_keepalive()
         if self.sid:
             try:
                 self.s.get(f'{self.base}/webapi/entry.cgi', timeout=10,
@@ -877,12 +930,13 @@ class Synology:
     def _api(self, params, retry=True):
         if not self.sid:
             raise SynologyError(None, 'Not logged in, run login() first')
-        p = dict(params, _sid=self.sid)
+        sid = self.sid
+        p = dict(params, _sid=sid)
         r = self.s.get(f'{self.base}/webapi/entry.cgi', params=p, timeout=60).json()
         if not r.get('success'):
             code = r.get('error', {}).get('code')
-            if code in (106, 107, 119) and retry and self._creds:
-                self.login(*self._creds, quiet=True)
+            if code in SESSION_ERRORS and retry and self._creds:
+                self._relogin(sid)
                 return self._api(params, retry=False)
             raise SynologyError(code, self.ERRORS.get(code, 'Unknown error'))
         return r.get('data', {})
@@ -996,16 +1050,19 @@ class Synology:
             return target
 
         os.makedirs(dest, exist_ok=True)
+        sid = self.sid
         params = {'api': 'SYNO.FileStation.Download', 'version': 2, 'method': 'download',
-                  'path': json.dumps([path]), 'mode': 'download', '_sid': self.sid}
+                  'path': json.dumps([path]), 'mode': 'download', '_sid': sid}
 
+        # No read timeout: DSM may zip a big folder for minutes before the
+        # first byte arrives.
         with self.s.get(f'{self.base}/webapi/entry.cgi', params=params,
-                        stream=True, timeout=60) as r:
+                        stream=True, timeout=(30, None)) as r:
             ctype = r.headers.get('Content-Type', '')
             if 'application/json' in ctype:
                 err = r.json().get('error', {}).get('code')
-                if err in (106, 107, 119) and _retry and self._creds:
-                    self.login(*self._creds, quiet=True)
+                if err in SESSION_ERRORS and _retry and self._creds:
+                    self._relogin(sid)
                     return self.download(path, dest, overwrite, extract, _retry=False)
                 raise SynologyError(err, self.ERRORS.get(err, 'Download failed'))
             if r.status_code == 404:
@@ -1070,6 +1127,7 @@ class Synology:
         name = remote_name or os.path.basename(local_path)
         dest_folder = dest_folder.rstrip('/') or '/'
         total = os.path.getsize(local_path)
+        sid = self.sid
 
         with open(local_path, 'rb') as fh:
             # Order matters: DSM needs the API fields *before* the file part,
@@ -1097,7 +1155,7 @@ class Synology:
                 monitor = MultipartEncoderMonitor(encoder, _cb)
                 try:
                     r = self.s.post(f'{self.base}/webapi/entry.cgi',
-                                    params={'_sid': self.sid}, data=monitor,
+                                    params={'_sid': sid}, data=monitor,
                                     headers={'Content-Type': monitor.content_type},
                                     timeout=(30, None)).json()
                 except Exception as e:
@@ -1106,8 +1164,8 @@ class Synology:
 
         if not r.get('success'):
             code = r.get('error', {}).get('code')
-            if code in (106, 107, 119) and _retry and self._creds:
-                self.login(*self._creds, quiet=True)
+            if code in SESSION_ERRORS and _retry and self._creds:
+                self._relogin(sid)
                 return self.upload(local_path, dest_folder, overwrite, create_parents,
                                    remote_name, show, _retry=False)
             raise SynologyError(code, self.ERRORS.get(code, 'Upload failed'))

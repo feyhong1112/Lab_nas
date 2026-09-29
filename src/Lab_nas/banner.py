@@ -154,6 +154,8 @@ def _login_state(session_reader):
     d = session_reader() if session_reader else None
     if not d:
         return False, 'not logged in  (lab_nas login)'
+    if d.get('expires') is None:
+        return True, f"{d.get('user')} @ {d.get('host')}  (no time limit)"
     left = max(0, int(d['expires'] - time.time()))
     return True, f"{d.get('user')} @ {d.get('host')}  ({left // 60} min left)"
 
