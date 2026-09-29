@@ -759,6 +759,22 @@ def _row(item, size):
     return f"{icon('file')} {size:>10}  {item['path']}"
 
 
+class _BigReads:
+    """Hand the upload body to the network in 1 MB pieces instead of 16 KB.
+
+    urllib3 normally reads a file-like body 16 KB at a time, and every read
+    also updates the progress bar. Bigger pieces mean far fewer of those
+    small steps, so less time is spent on overhead and more on sending.
+    """
+
+    def __init__(self, stream, size=1024 * 1024):
+        self._stream, self._size = stream, size
+        self.len = stream.len          # requests uses this for Content-Length
+
+    def read(self, _n=-1):
+        return self._stream.read(self._size)
+
+
 class Synology:
     """Synology File Station client that talks to the NAS through NetBird.
 
@@ -941,6 +957,14 @@ class Synology:
             raise SynologyError(code, self.ERRORS.get(code, 'Unknown error'))
         return r.get('data', {})
 
+    def _ensure_session(self):
+        """Cheap call that logs in again if the NAS ended the session.
+
+        Run before a big transfer so it always starts with a valid session,
+        instead of sending a whole file only to be told the session expired.
+        """
+        self._api({'api': 'SYNO.FileStation.Info', 'version': 2, 'method': 'get'})
+
     # ---- browsing
 
     def ls(self, path='/', show=True, pattern=None):
@@ -1050,6 +1074,7 @@ class Synology:
             return target
 
         os.makedirs(dest, exist_ok=True)
+        self._ensure_session()
         sid = self.sid
         params = {'api': 'SYNO.FileStation.Download', 'version': 2, 'method': 'download',
                   'path': json.dumps([path]), 'mode': 'download', '_sid': sid}
@@ -1127,6 +1152,7 @@ class Synology:
         name = remote_name or os.path.basename(local_path)
         dest_folder = dest_folder.rstrip('/') or '/'
         total = os.path.getsize(local_path)
+        self._ensure_session()
         sid = self.sid
 
         with open(local_path, 'rb') as fh:
@@ -1155,7 +1181,7 @@ class Synology:
                 monitor = MultipartEncoderMonitor(encoder, _cb)
                 try:
                     r = self.s.post(f'{self.base}/webapi/entry.cgi',
-                                    params={'_sid': sid}, data=monitor,
+                                    params={'_sid': sid}, data=_BigReads(monitor),
                                     headers={'Content-Type': monitor.content_type},
                                     timeout=(30, None)).json()
                 except Exception as e:
@@ -1176,11 +1202,40 @@ class Synology:
                       f'{time.time() - start:.1f}s -> {hl(remote)}')
         return remote
 
-    def upload_more(self, local_paths, dest_folder, overwrite=False, create_parents=True):
-        results = []
-        for p in local_paths:
-            try:
-                results.append(self.upload(p, dest_folder, overwrite, create_parents))
-            except SynologyError as e:
-                say('error', f'Failed {p}: {e}')
+    def upload_more(self, local_paths, dest_folder, overwrite=False,
+                    create_parents=True, workers=4):
+        """Upload several files at the same time (default: 4 at once).
+
+        Several connections together usually move more data than one.
+        The per-file progress bars are hidden (they would overlap); a line
+        is printed as each file finishes. workers=1 uploads one at a time
+        with the normal progress bar.
+        """
+        local_paths = list(local_paths)
+        if workers <= 1 or len(local_paths) <= 1:
+            results = []
+            for p in local_paths:
+                try:
+                    results.append(self.upload(p, dest_folder, overwrite, create_parents))
+                except SynologyError as e:
+                    say('error', f'Failed {p}: {e}')
+            return results
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        self._ensure_session()  # log in once up front, not in every thread
+        results, start = [], time.time()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = {pool.submit(self.upload, p, dest_folder, overwrite,
+                                create_parents, None, False): p
+                    for p in local_paths}
+            for n, job in enumerate(as_completed(jobs), 1):
+                p = jobs[job]
+                try:
+                    results.append(job.result())
+                    say('up', f'[{n}/{len(jobs)}] {hl(os.path.basename(p))} '
+                              f'({_human(os.path.getsize(p))})')
+                except SynologyError as e:
+                    say('error', f'[{n}/{len(jobs)}] Failed {p}: {e}')
+        say('up', f'{len(results)}/{len(jobs)} files uploaded in '
+                  f'{time.time() - start:.1f}s')
         return results
