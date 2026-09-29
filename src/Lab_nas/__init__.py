@@ -1040,7 +1040,8 @@ class Synology:
             pass
         return None
 
-    def download(self, path, dest=None, overwrite=False, extract=False, _retry=True):
+    def download(self, path, dest=None, overwrite=False, extract=False, show=True,
+                 _retry=True):
         """Download a file, or a folder (fetched as a single .zip from the NAS).
 
         A folder is always returned zipped by DSM; this saves it with a .zip
@@ -1088,7 +1089,7 @@ class Synology:
                 err = r.json().get('error', {}).get('code')
                 if err in SESSION_ERRORS and _retry and self._creds:
                     self._relogin(sid)
-                    return self.download(path, dest, overwrite, extract, _retry=False)
+                    return self.download(path, dest, overwrite, extract, show, _retry=False)
                 raise SynologyError(err, self.ERRORS.get(err, 'Download failed'))
             if r.status_code == 404:
                 raise SynologyError(408, f'No such file or folder on the NAS: {path}')
@@ -1107,23 +1108,57 @@ class Synology:
             total = int(r.headers.get('Content-Length', 0))
             done, start = 0, time.time()
             tmp = out + '.part'
-            with open(tmp, 'wb') as f, _progress(total, name) as update:
+            with open(tmp, 'wb') as f, _progress(total, name, show) as update:
                 for chunk in r.iter_content(1024 * 1024):
                     f.write(chunk)
                     done += len(chunk)
                     update(len(chunk))
             os.replace(tmp, out)
 
-        say('down', f'{hl(name)}: {_human(done)} done in {time.time() - start:.1f}s -> {hl(out)}')
+        if show:
+            say('down', f'{hl(name)}: {_human(done)} done in '
+                        f'{time.time() - start:.1f}s -> {hl(out)}')
         return _maybe_extract(out)
 
-    def download_more(self, paths, dest=None, overwrite=False, extract=False):
-        results = []
-        for p in paths:
-            try:
-                results.append(self.download(p, dest, overwrite, extract))
-            except SynologyError as e:
-                say('error', f'Failed {p}: {e}')
+    def download_more(self, paths, dest=None, overwrite=False, extract=False,
+                      workers=4):
+        """Download several files/folders at the same time (default: 4 at once).
+
+        Several connections together usually move more data than one.
+        The per-file progress bars are hidden (they would overlap); a line
+        is printed as each item finishes. workers=1 downloads one at a time
+        with the normal progress bar.
+        """
+        paths = list(paths)
+        # Two NAS paths with the same name would be saved to the same local
+        # file; downloading those at the same time would clash, so go one by one.
+        names = [os.path.basename(p.rstrip('/')).lower() for p in paths]
+        if workers <= 1 or len(paths) <= 1 or len(set(names)) < len(names):
+            results = []
+            for p in paths:
+                try:
+                    results.append(self.download(p, dest, overwrite, extract))
+                except SynologyError as e:
+                    say('error', f'Failed {p}: {e}')
+            return results
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        self._ensure_session()  # log in once up front, not in every thread
+        results, start = [], time.time()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = {pool.submit(self.download, p, dest, overwrite, extract, False): p
+                    for p in paths}
+            for n, job in enumerate(as_completed(jobs), 1):
+                p = jobs[job]
+                try:
+                    out = job.result()
+                    results.append(out)
+                    size = _human(os.path.getsize(out)) if os.path.isfile(out) else 'folder'
+                    say('down', f'[{n}/{len(jobs)}] {hl(os.path.basename(out))} ({size})')
+                except Exception as e:  # one failed file must not stop the others
+                    say('error', f'[{n}/{len(jobs)}] Failed {p}: {e}')
+        say('down', f'{len(results)}/{len(jobs)} downloaded in '
+                    f'{time.time() - start:.1f}s')
         return results
 
     # ---- uploading
