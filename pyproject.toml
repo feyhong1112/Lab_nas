@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lab_me_nas"
-version = "0.3.1"
+version = "0.3.2"
 description = "Access a Synology NAS from Google Colab, Linux or Windows through a NetBird mesh network."
 readme = "README.md"
 requires-python = ">=3.8"
