@@ -61,7 +61,7 @@ import subprocess
 import urllib.request
 from contextlib import contextmanager
 
-__version__ = '0.3.1'
+__version__ = '0.3.2'
 __auther__ = "Fey's lite Pro Max Duo Ultra Edition"
 __all__ = ['NetBird', 'Synology', 'SynologyError', 'default_config_dir']
 
