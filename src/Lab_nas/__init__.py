@@ -184,6 +184,26 @@ def _port_open(port, host='127.0.0.1'):
         return s.connect_ex((host, port)) == 0
 
 
+def _tcp_ok(host, port, socks_port=None, timeout=5):
+    """Can we open a TCP connection to host:port (through SOCKS5 if given)?"""
+    try:
+        if socks_port:
+            _ensure_pysocks()
+            import socks
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS5, '127.0.0.1', socks_port, rdns=True)
+        else:
+            s = socket.socket()
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        finally:
+            s.close()
+    except Exception:
+        return False
+
+
 def _human(n):
     n = float(n or 0)
     for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
@@ -469,6 +489,17 @@ class NetBird:
     def ip(self, system=False):
         return (self.info(system).get('netbirdIp') or '').split('/')[0] or None
 
+    def reachable(self, host, ports=(5001, 5000, 443), tries=3, wait=3):
+        """Is `host` reachable through this NetBird? Retries a few times because
+        with lazy connections the first packet only starts the peer handshake."""
+        socks_port = self.socks_port if self.mode != 'system' else None
+        for i in range(tries):
+            if any(_tcp_ok(host, p, socks_port) for p in ports):
+                return True
+            if i < tries - 1:
+                time.sleep(wait)
+        return False
+
     def status(self):
         if not self.exe:
             self.install()
@@ -688,7 +719,8 @@ class NetBird:
         raise RuntimeError('Could not connect to NetBird. Check the setup key '
                            '(NETBIRD_SETUP_KEY) and look at the log (lab_nas log, or NetBird().log())')
 
-    def start(self, setup_key=None, timeout=None, use_system=True, force=False):
+    def start(self, setup_key=None, timeout=None, use_system=True, force=False,
+              peer=None):
         """Connect to NetBird. Safe to run again at any time.
 
         setup_key   only used if the saved identity can't connect
@@ -696,6 +728,9 @@ class NetBird:
         use_system  if a NetBird app/service on this machine is already
                     connected, use it instead of starting our own
         force       restart our daemon even if it is already connected
+        peer        NAS NetBird IP; if given, check it is really reachable and
+                    restart the daemon when the tunnel went stale (e.g. after
+                    an interrupted transfer)
         """
         if timeout:
             self.timeout = timeout
@@ -714,9 +749,12 @@ class NetBird:
         if not force and self.running() and self.connected() \
                 and _port_open(self.socks_port):
             self.mode = 'netstack'
-            say('ok', f'NetBird already connected as {hl(self.hostname)} '
-                      f'(IP {hl(self.ip())}), SOCKS5 proxy on {self.socks_port}')
-            return self
+            if not peer or self.reachable(peer):
+                say('ok', f'NetBird already connected as {hl(self.hostname)} '
+                          f'(IP {hl(self.ip())}), SOCKS5 proxy on {self.socks_port}')
+                return self
+            say('warn', f'NetBird is up but {hl(peer)} does not answer '
+                        f'(stale tunnel). Restarting NetBird...')
 
         self.stop(quiet=True)
         have_identity = self._restore_identity()
@@ -743,6 +781,13 @@ class NetBird:
                   f'SOCKS5 proxy on {self.socks_port}')
         if self.saved_cfg:
             say('save', f'Identity saved to {hl(self.saved_cfg)}')
+        if peer:
+            say('wait', f'Waiting for {hl(peer)} to answer...')
+            if self.reachable(peer, tries=10, wait=3):
+                say('ok', f'{hl(peer)} is reachable')
+            else:
+                say('warn', f'{hl(peer)} does not answer. Is the NAS online in the '
+                            f'NetBird dashboard, and is the IP right?')
         return self
 
 
@@ -882,25 +927,40 @@ class Synology:
 
     # ---- connection
 
-    def detect(self):
-        """Find which DSM port/method answers the API (no password sent)."""
+    def detect(self, rounds=3, wait=5):
+        """Find which DSM port/method answers the API (no password sent).
+
+        Tries a few rounds: with NetBird lazy connections the first request
+        only wakes the peer tunnel, so it often fails once and then works.
+        """
         probe = {'api': 'SYNO.API.Info', 'version': 1, 'method': 'query',
                  'query': 'SYNO.API.Auth'}
-        for base in self.bases:
-            for method in ('POST', 'GET'):
-                try:
-                    url = f'{base}/webapi/query.cgi'
-                    r = (self.s.post(url, data=probe, timeout=5) if method == 'POST'
-                         else self.s.get(url, params=probe, timeout=5))
-                    if (r.headers.get('Content-Type', '').startswith('application/json')
-                            and r.json().get('success')):
-                        self.base, self.login_method = base, method
-                        return base
-                except Exception:
-                    continue
+        last = None
+        for rnd in range(rounds):
+            for base in self.bases:
+                for method in ('POST', 'GET'):
+                    try:
+                        url = f'{base}/webapi/query.cgi'
+                        r = (self.s.post(url, data=probe, timeout=10) if method == 'POST'
+                             else self.s.get(url, params=probe, timeout=10))
+                        if (r.headers.get('Content-Type', '').startswith('application/json')
+                                and r.json().get('success')):
+                            self.base, self.login_method = base, method
+                            return base
+                        last = f'{base} answered HTTP {r.status_code}, not the DSM API'
+                    except Exception as e:
+                        last = f'{base}: {type(e).__name__}: {str(e)[:150]}'
+            if rnd < rounds - 1:
+                say('wait', f'NAS not answering yet, retrying in {wait} s '
+                            f'({rnd + 2}/{rounds})...')
+                time.sleep(wait)
+        hint = (' If NetBird says "already connected", the tunnel may be stale '
+                '(e.g. after an interrupted transfer): run NetBird().start(force=True) '
+                'or start(peer=NAS_IP).' if self.use_proxy else '')
         raise SynologyError(None, f'Cannot reach the NAS at {self.host}. '
                                   'Check that NetBird is connected (lab_nas status) '
-                                  'and that the IP is correct (NetBird dashboard -> Peers).')
+                                  'and that the IP is correct (NetBird dashboard -> Peers). '
+                                  f'Last error: {last}.{hint}')
 
     def login(self, account=None, password=None, otp=None, quiet=False):
         if not self.base:
