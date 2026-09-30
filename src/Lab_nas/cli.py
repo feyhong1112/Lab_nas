@@ -159,12 +159,32 @@ def _nas(a):
     return nas, False
 
 
+_STALE_HINT = ('Cannot reach the NAS. If NetBird says it is connected, the tunnel '
+               'may be stale (e.g. after an interrupted transfer): run '
+               '"lab_nas start --force" and try again')
+
+
+def _is_unreachable(e):
+    import requests
+    return isinstance(e, (requests.exceptions.ConnectionError,
+                          requests.exceptions.Timeout))
+
+
 def _with_nas(fn):
     def run(a):
-        nas, saved = _nas(a)
+        try:
+            nas, saved = _nas(a)
+        except Exception as e:
+            if _is_unreachable(e):
+                raise SynologyError(None, _STALE_HINT) from None
+            raise
         try:
             return fn(nas, a)
-        except SynologyError as e:
+        except Exception as e:
+            if _is_unreachable(e):
+                raise SynologyError(None, _STALE_HINT) from None
+            if not isinstance(e, SynologyError):
+                raise
             if saved and e.code in (106, 107, 119):
                 _delete_session()
                 raise SynologyError(e.code, 'The NAS ended the saved login '
@@ -257,7 +277,12 @@ def cmd_upload(nas, a):
 
 
 def cmd_start(a):
-    _netbird(a).start(setup_key=a.setup_key, use_system=not a.own, force=a.force)
+    # Check the NAS really answers, so a stale tunnel (e.g. after an
+    # interrupted transfer) is restarted instead of reported as "connected"
+    peer = None if a.no_check else (a.host or os.environ.get('LAB_NAS_HOST')
+                                    or _last_host())
+    _netbird(a).start(setup_key=a.setup_key, use_system=not a.own, force=a.force,
+                      peer=peer)
 
 
 def cmd_stop(a):
@@ -420,7 +445,7 @@ class _CommandHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """Include input hints in the top-level command list only."""
 
     _inputs = {
-        'start': '[-k KEY]',
+        'start': '[-k KEY] [-H IP]',
         'log': '[-n COUNT]',
         'path': '[--fix]',
         'login': '[-H IP] [-u USERNAME] [-m MINUTES]',
@@ -508,6 +533,12 @@ If lab_nas is not found, use python -m Lab_nas (Windows: py -m Lab_nas).""")
                    help="start Lab_nas's own NetBird even if a NetBird app is connected")
     s.add_argument('-f', '--force', action='store_true',
                    help='reconnect even if connected (no value needed)')
+    s.add_argument('-H', '--host', metavar='IP',
+                   help='NAS NetBird IP to check after connecting; NetBird is '
+                        'restarted if it does not answer (default: LAB_NAS_HOST '
+                        'or the last host you logged in to)')
+    s.add_argument('--no-check', action='store_true',
+                   help="don't check that the NAS answers")
     s.set_defaults(func=cmd_start)
 
     command('stop', 'disconnect', ['lab_nas stop'], parents=[nb]).set_defaults(func=cmd_stop)
