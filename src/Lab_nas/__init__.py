@@ -61,7 +61,7 @@ import subprocess
 import urllib.request
 from contextlib import contextmanager
 
-__version__ = '0.3.2'
+__version__ = '0.3.1'
 __auther__ = "Fey's lite Pro Max Duo Ultra Edition"
 __all__ = ['NetBird', 'Synology', 'SynologyError', 'default_config_dir']
 
@@ -888,7 +888,8 @@ class Synology:
     OFFICE_EXT = ('.osheet', '.odoc', '.oslides')
 
     def __init__(self, host, bases=None, socks_port=SOCKS_PORT, use_proxy='auto',
-                 user_secret='SYNO_USER', pass_secret='SYNO_PASS', keepalive=KEEPALIVE):
+                 user_secret='SYNO_USER', pass_secret='SYNO_PASS', keepalive=KEEPALIVE,
+                 netbird=None):
         _ensure_pysocks()
         import requests
         import urllib3
@@ -905,6 +906,7 @@ class Synology:
         self._creds = None
 
         self.keepalive = keepalive
+        self.netbird = netbird   # optional NetBird(); lets transfers restart a dead tunnel
         self._lock = threading.RLock()
         self._ka_stop = None
         self._ka_thread = None
@@ -1008,6 +1010,23 @@ class Synology:
             if not self._creds:
                 raise SynologyError(106, self.ERRORS[106])
             self.login(*self._creds, quiet=True)
+
+    def _heal(self):
+        """After a dropped transfer: drop dead pooled sockets and, if the NAS
+        no longer answers through NetBird, restart the tunnel."""
+        try:
+            self.s.close()   # pooled connections through a dead tunnel stay dead
+        except Exception:
+            pass
+        nb = self.netbird
+        if not nb or not self.use_proxy or nb.reachable(self.host, tries=2):
+            return
+        say('warn', f'{hl(self.host)} no longer answers through NetBird; '
+                    'restarting the tunnel...')
+        try:
+            nb.start(force=True, peer=self.host)
+        except Exception as e:
+            say('warn', f'NetBird restart failed: {e}')
 
     # ---- keep-alive
 
@@ -1200,6 +1219,7 @@ class Synology:
                 note = f', will try to continue from {_human(have)}' if have else ''
                 _wait_before_retry(attempt, 'download', name, _why(e.cause),
                                    retries + 1, note)
+                self._heal()
 
         if not (extract and out.lower().endswith('.zip')):
             return out
@@ -1213,7 +1233,12 @@ class Synology:
     def _download_once(self, path, dest, overwrite, is_dir, show, resume_part=None,
                        _retry=True):
         """One download attempt. Raises _ConnectionLost if the network drops."""
-        self._ensure_session()
+        try:
+            self._ensure_session()
+        except Exception as e:
+            if _is_net_drop(e):
+                raise _ConnectionLost(e, resume_part) from None
+            raise
         sid = self.sid
         params = {'api': 'SYNO.FileStation.Download', 'version': 2, 'method': 'download',
                   'path': json.dumps([path]), 'mode': 'download', '_sid': sid}
@@ -1356,6 +1381,7 @@ class Synology:
                               f'Check NetBird with nb.status() and try again.') from None
                 _wait_before_retry(attempt, 'upload', name, _why(e.cause), retries + 1,
                                    ', starting again from 0%')
+                self._heal()
             except SynologyError as e:
                 # The previous try may have reached the NAS even though its reply
                 # was lost; then this try sees "file already exists".
@@ -1380,7 +1406,12 @@ class Synology:
         name = remote_name or os.path.basename(local_path)
         dest_folder = dest_folder.rstrip('/') or '/'
         total = os.path.getsize(local_path)
-        self._ensure_session()
+        try:
+            self._ensure_session()
+        except Exception as e:
+            if _is_net_drop(e):
+                raise _ConnectionLost(e) from None
+            raise
         sid = self.sid
 
         with open(local_path, 'rb') as fh:
