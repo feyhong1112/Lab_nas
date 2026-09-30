@@ -61,7 +61,7 @@ import subprocess
 import urllib.request
 from contextlib import contextmanager
 
-__version__ = '0.3.0'
+__version__ = '0.3.1'
 __auther__ = "Fey's lite Pro Max Duo Ultra Edition"
 __all__ = ['NetBird', 'Synology', 'SynologyError', 'default_config_dir']
 
@@ -71,6 +71,8 @@ DAEMON_PORT = 41799           # our own daemon; never clashes with a system NetB
 CONNECT_TIMEOUT = 60          # seconds to wait for `netbird up`
 KEEPALIVE = 300               # seconds between NAS pings that keep a login alive
 SESSION_ERRORS = (106, 107, 119)  # DSM: timed out / interrupted / invalid -> re-login
+NET_RETRIES = 3               # extra tries when the connection breaks mid-transfer
+NET_WAITS = (5, 15, 30)       # seconds to wait before each of those tries
 _UNSET = object()
 
 
@@ -746,6 +748,45 @@ class NetBird:
 
 # ---------------------------------------------------------------- Synology
 
+class _ConnectionLost(Exception):
+    """Internal: the network dropped during a transfer (safe to retry)."""
+
+    def __init__(self, cause, part_file=None):
+        super().__init__(str(cause))
+        self.cause, self.part_file = cause, part_file
+
+
+def _is_net_drop(e):
+    """True for errors that mean 'the connection broke', not 'the NAS said no'."""
+    import requests
+    return isinstance(e, (requests.exceptions.ConnectionError,
+                          requests.exceptions.ChunkedEncodingError,
+                          requests.exceptions.Timeout,
+                          ConnectionError, TimeoutError))
+
+
+def _why(e):
+    """Short, readable reason for a network error (the innermost message)."""
+    seen, inner = set(), e
+    while True:  # requests wraps urllib3 errors, which wrap socket errors
+        nxt = (inner.args[0] if inner.args and isinstance(inner.args[0], BaseException)
+               else inner.__cause__ or inner.__context__)
+        if nxt is None or id(nxt) in seen:
+            break
+        seen.add(id(nxt))
+        inner = nxt
+    text = str(inner).strip() or type(inner).__name__
+    text = re.sub(r'<[^>]*object at 0x[0-9a-f]+>:?\s*', '', text)
+    return f'{type(e).__name__}: {text[:160]}'
+
+
+def _wait_before_retry(attempt, what, name, reason, tries, note=''):
+    wait = NET_WAITS[min(attempt, len(NET_WAITS) - 1)]
+    say('warn', f'Connection lost during {what} of {hl(name)} ({reason}).')
+    say('wait', f'Retrying in {wait}s (try {attempt + 2}/{tries}){note}...')
+    time.sleep(wait)
+
+
 class SynologyError(Exception):
     def __init__(self, code, message):
         self.code = code
@@ -796,6 +837,7 @@ class Synology:
         403: '2-factor code required', 404: 'Wrong 2-factor code',
         407: 'Operation not permitted / IP blocked',
         408: 'No such file or folder (check the path)',
+        414: 'A file with this name already exists (use overwrite=True)',
         409: 'File system not supported',
     }
     OFFICE_EXT = ('.osheet', '.odoc', '.oslides')
@@ -1023,6 +1065,19 @@ class Synology:
 
     # ---- downloading
 
+    def _remote_size(self, path):
+        """Size in bytes of a file on the NAS, or None if unknown/missing."""
+        try:
+            data = self._api({'api': 'SYNO.FileStation.List', 'version': 2,
+                              'method': 'getinfo', 'path': json.dumps([path]),
+                              'additional': json.dumps(['size'])})
+            files = data.get('files', [])
+            if files and 'code' not in files[0]:
+                return files[0].get('additional', {}).get('size')
+        except SynologyError:
+            pass
+        return None
+
     def _isdir(self, path):
         """Ask the NAS whether path is a folder.
 
@@ -1041,7 +1096,7 @@ class Synology:
         return None
 
     def download(self, path, dest=None, overwrite=False, extract=False, show=True,
-                 _retry=True):
+                 retries=NET_RETRIES):
         """Download a file, or a folder (fetched as a single .zip from the NAS).
 
         A folder is always returned zipped by DSM; this saves it with a .zip
@@ -1052,6 +1107,9 @@ class Synology:
 
         dest           local folder (default: /content in Colab, else the
                        current folder)
+        retries        if the connection breaks mid-download, try again this
+                       many times. Where the NAS allows it, a retry continues
+                       from where it stopped instead of starting over.
 
         Returns the local path (the .zip, or the extracted folder if extract).
         """
@@ -1063,62 +1121,109 @@ class Synology:
             raise SynologyError(None, 'Not logged in, run login() first')
 
         is_dir = self._isdir(path)  # decided before the transfer, not from headers
-
-        def _maybe_extract(zip_path):
-            if not (extract and zip_path.lower().endswith('.zip')):
-                return zip_path
-            import zipfile
-            target = zip_path[:-4]
-            with zipfile.ZipFile(zip_path) as z:
-                z.extractall(target)
-            say('zip', f'Extracted -> {hl(target)}')
-            return target
-
         os.makedirs(dest, exist_ok=True)
+        name = os.path.basename(path.rstrip('/'))
+
+        part = None
+        for attempt in range(retries + 1):
+            try:
+                out = self._download_once(path, dest, overwrite, is_dir, show, part)
+                break
+            except _ConnectionLost as e:
+                part = e.part_file
+                if attempt == retries:
+                    raise SynologyError(
+                        None, f'Download of {name} failed: the connection was lost '
+                              f'{retries + 1} times in a row ({_why(e.cause)}). '
+                              f'Check NetBird with nb.status() and try again.') from None
+                have = os.path.getsize(part) if part and os.path.exists(part) else 0
+                note = f', will try to continue from {_human(have)}' if have else ''
+                _wait_before_retry(attempt, 'download', name, _why(e.cause),
+                                   retries + 1, note)
+
+        if not (extract and out.lower().endswith('.zip')):
+            return out
+        import zipfile
+        target = out[:-4]
+        with zipfile.ZipFile(out) as z:
+            z.extractall(target)
+        say('zip', f'Extracted -> {hl(target)}')
+        return target
+
+    def _download_once(self, path, dest, overwrite, is_dir, show, resume_part=None,
+                       _retry=True):
+        """One download attempt. Raises _ConnectionLost if the network drops."""
         self._ensure_session()
         sid = self.sid
         params = {'api': 'SYNO.FileStation.Download', 'version': 2, 'method': 'download',
                   'path': json.dumps([path]), 'mode': 'download', '_sid': sid}
 
-        # No read timeout: DSM may zip a big folder for minutes before the
-        # first byte arrives.
-        with self.s.get(f'{self.base}/webapi/entry.cgi', params=params,
-                        stream=True, timeout=(30, None)) as r:
-            ctype = r.headers.get('Content-Type', '')
-            if 'application/json' in ctype:
-                err = r.json().get('error', {}).get('code')
-                if err in SESSION_ERRORS and _retry and self._creds:
-                    self._relogin(sid)
-                    return self.download(path, dest, overwrite, extract, show, _retry=False)
-                raise SynologyError(err, self.ERRORS.get(err, 'Download failed'))
-            if r.status_code == 404:
-                raise SynologyError(408, f'No such file or folder on the NAS: {path}')
-            if not r.ok:
-                raise SynologyError(None, f'Download failed (HTTP {r.status_code}): {path}')
+        # Continuing an interrupted download: ask only for the missing part.
+        offset = 0
+        if resume_part and os.path.exists(resume_part):
+            offset = os.path.getsize(resume_part)
+        headers = {'Range': f'bytes={offset}-'} if offset else {}
 
-            name = os.path.basename(path.rstrip('/'))
-            # A folder (or a zip Content-Type as a fallback) is saved as .zip.
-            if (is_dir or 'zip' in ctype) and not name.lower().endswith('.zip'):
-                name += '.zip'
-            out = os.path.join(dest, name)
-            if os.path.exists(out) and not overwrite:
-                say('skip', f'Already exists, skipped: {out}  (use overwrite)')
-                return _maybe_extract(out)
+        tmp = None
+        try:
+            # No read timeout: DSM may zip a big folder for minutes before the
+            # first byte arrives.
+            with self.s.get(f'{self.base}/webapi/entry.cgi', params=params,
+                            headers=headers, stream=True, timeout=(30, None)) as r:
+                ctype = r.headers.get('Content-Type', '')
+                if 'application/json' in ctype:
+                    err = r.json().get('error', {}).get('code')
+                    if err in SESSION_ERRORS and _retry and self._creds:
+                        self._relogin(sid)
+                        return self._download_once(path, dest, overwrite, is_dir, show,
+                                                   resume_part, _retry=False)
+                    raise SynologyError(err, self.ERRORS.get(err, 'Download failed'))
+                if r.status_code == 404:
+                    raise SynologyError(408, f'No such file or folder on the NAS: {path}')
+                if not r.ok:
+                    raise SynologyError(None, f'Download failed (HTTP {r.status_code}): {path}')
 
-            total = int(r.headers.get('Content-Length', 0))
-            done, start = 0, time.time()
-            tmp = out + '.part'
-            with open(tmp, 'wb') as f, _progress(total, name, show) as update:
-                for chunk in r.iter_content(1024 * 1024):
-                    f.write(chunk)
-                    done += len(chunk)
-                    update(len(chunk))
-            os.replace(tmp, out)
+                name = os.path.basename(path.rstrip('/'))
+                # A folder (or a zip Content-Type as a fallback) is saved as .zip.
+                if (is_dir or 'zip' in ctype) and not name.lower().endswith('.zip'):
+                    name += '.zip'
+                out = os.path.join(dest, name)
+                if resume_part is None and os.path.exists(out) and not overwrite:
+                    say('skip', f'Already exists, skipped: {out}  (use overwrite)')
+                    return out
+                tmp = out + '.part'
+
+                # 206 = the NAS agreed to send only the rest. Anything else means
+                # it sent the whole file again, so start the .part file over.
+                resumed = (offset and tmp == resume_part and r.status_code == 206 and
+                           r.headers.get('Content-Range', '').startswith(f'bytes {offset}-'))
+                if not resumed:
+                    offset = 0
+                total = offset + int(r.headers.get('Content-Length', 0))
+                done, start = offset, time.time()
+                if resumed:
+                    say('down', f'Continuing {hl(name)} from {_human(offset)}')
+
+                with open(tmp, 'ab' if resumed else 'wb') as f, \
+                        _progress(total, name, show) as update:
+                    if offset:
+                        update(offset)
+                    for chunk in r.iter_content(1024 * 1024):
+                        f.write(chunk)
+                        done += len(chunk)
+                        update(len(chunk))
+                if total and done < total:  # stream ended early without an error
+                    raise ConnectionError(f'stream ended at {_human(done)} of {_human(total)}')
+                os.replace(tmp, out)
+        except Exception as e:
+            if _is_net_drop(e):
+                raise _ConnectionLost(e, tmp) from None
+            raise
 
         if show:
             say('down', f'{hl(name)}: {_human(done)} done in '
                         f'{time.time() - start:.1f}s -> {hl(out)}')
-        return _maybe_extract(out)
+        return out
 
     def download_more(self, paths, dest=None, overwrite=False, extract=False,
                       workers=4):
@@ -1164,17 +1269,45 @@ class Synology:
     # ---- uploading
 
     def upload(self, local_path, dest_folder, overwrite=False, create_parents=True,
-               remote_name=None, show=True, _retry=True):
+               remote_name=None, show=True, retries=NET_RETRIES):
         """Upload a local file to a NAS folder and return the remote path.
 
         dest_folder    e.g. '/home/Drive' (a shared folder or a path inside one)
         overwrite      True replaces an existing file; False errors if it exists
         create_parents create dest_folder (and parents) if it doesn't exist
         remote_name    store under a different name than the local file's
+        retries        if the connection breaks mid-upload, try again this many
+                       times (each try starts from 0%: DSM can't resume uploads)
 
         Only single files are supported (the DSM upload API takes one file per
         request); to send a folder, zip it locally first and upload the .zip.
         """
+        name = remote_name or os.path.basename(local_path)
+        remote = f"{dest_folder.rstrip('/') or '/'}/{name}"
+        for attempt in range(retries + 1):
+            try:
+                return self._upload_once(local_path, dest_folder, overwrite,
+                                         create_parents, remote_name, show)
+            except _ConnectionLost as e:
+                if attempt == retries:
+                    raise SynologyError(
+                        None, f'Upload of {name} failed: the connection was lost '
+                              f'{retries + 1} times in a row ({_why(e.cause)}). '
+                              f'Check NetBird with nb.status() and try again.') from None
+                _wait_before_retry(attempt, 'upload', name, _why(e.cause), retries + 1,
+                                   ', starting again from 0%')
+            except SynologyError as e:
+                # The previous try may have reached the NAS even though its reply
+                # was lost; then this try sees "file already exists".
+                if (attempt and e.code == 414 and
+                        self._remote_size(remote) == os.path.getsize(local_path)):
+                    say('up', f'{hl(name)} had already arrived -> {hl(remote)}')
+                    return remote
+                raise
+
+    def _upload_once(self, local_path, dest_folder, overwrite, create_parents,
+                     remote_name, show, _retry=True):
+        """One upload attempt. Raises _ConnectionLost if the network drops."""
         if not self.sid:
             raise SynologyError(None, 'Not logged in, run login() first')
         if not os.path.isfile(local_path):
@@ -1220,15 +1353,16 @@ class Synology:
                                     headers={'Content-Type': monitor.content_type},
                                     timeout=(30, None)).json()
                 except Exception as e:
-                    raise SynologyError(
-                        None, f'Upload request failed ({type(e).__name__})') from None
+                    if _is_net_drop(e):
+                        raise _ConnectionLost(e) from None
+                    raise SynologyError(None, f'Upload request failed ({_why(e)})') from None
 
         if not r.get('success'):
             code = r.get('error', {}).get('code')
             if code in SESSION_ERRORS and _retry and self._creds:
                 self._relogin(sid)
-                return self.upload(local_path, dest_folder, overwrite, create_parents,
-                                   remote_name, show, _retry=False)
+                return self._upload_once(local_path, dest_folder, overwrite,
+                                         create_parents, remote_name, show, _retry=False)
             raise SynologyError(code, self.ERRORS.get(code, 'Upload failed'))
 
         remote = f'{dest_folder}/{name}'
